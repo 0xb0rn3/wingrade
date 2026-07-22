@@ -10,6 +10,11 @@ Run as Administrator on the target 8.1 box. Old TLS defaults on 8.1 kill the fet
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; &([scriptblock]::Create((irm 'https://raw.githubusercontent.com/0xb0rn3/wingrade/main/wingrade.ps1'))) -NoReboot
 ```
 
+
+```powershell for direct download 
+&([scriptblock]::Create((irm 'https://raw.githubusercontent.com/0xb0rn3/wingrade/main/wingrade.ps1'))) -IsoUrl 'https://software.download.prss.microsoft.com/dbazure/Win10_22H2_EnglishInternational_x64v1.iso?t=b8852cb3-95f7-4fad-8a72-05b2ad6286d6&P1=1784842988&P2=602&P3=2&P4=WXG3U2T0LOzR3sNVPC%2fJUHCSfT7inCZ5qjeoxMW%2bL3AkDWIuql3qSgMn1hD2VH%2bx7thqF2q71gmT5HAbRwA9UQL85gs3aBoxFB2T7uedjWqztAc9dEpXJp708tLh8WdbYtoqb8EvWaI6GisBDEQfoQPzz6x0qK72%2fxqFCw5wY%2fIPKal3TqJLvq9cdocaUWYdtiMTRa8SzRE7MAztF%2flLXpLzOBCp4oAZoOnuieEBgCn694FDRSqROraFMcRw2SkmWWYfN7M6fE1g2agcU3Mn%2btU0cQ2kaWIH6KyjvoybeuavxrKiFrr3R7lxjGDvSXzqw2dzRIEVL%2fGuGTbRPjaRMA%3d%3d' -NoReboot
+```
+
 Drop `-NoReboot` to let it auto-restart and finish the upgrade on its own.
 
 ## What it does
