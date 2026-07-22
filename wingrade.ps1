@@ -3,10 +3,11 @@
 .SYNOPSIS
     wingrade — Windows 8.1 -> Windows 10 unattended upgrade bootstrapper
 .DESCRIPTION
-    Downloads Windows 10 install media, suspends competing services (Windows
-    Update, BITS-consuming background tasks, non-critical scheduled tasks),
-    snapshots pre-upgrade state, then invokes setup.exe for a silent in-place
-    upgrade. Restores service state on exit regardless of outcome.
+    Downloads Windows 10 install media, snapshots pre-upgrade state, suspends
+    services that compete with setup.exe for I/O/network (never touching
+    remote-access tooling like TeamViewer/RDP), then invokes setup.exe for a
+    silent in-place upgrade. Restores service state on exit regardless of
+    outcome. Warns explicitly before any reboot if a remote session is active.
 .PARAMETER Arch
     x64 or x86 (default: auto-detect)
 .PARAMETER IsoUrl
@@ -20,14 +21,15 @@
 .PARAMETER NoSnapshot
     Skip pre-upgrade backup/restore-point creation
 .PARAMETER UnattendPath
-    Path to a custom unattend.xml to inject into setup (for domain-joined/AD scenarios)
+    Path to a custom unattend.xml to inject into setup (domain/AD scenarios)
 .PARAMETER LogPath
     Log directory (default: C:\wingrade)
+.PARAMETER TimeoutMinutes
+    Max minutes to wait on setup.exe before giving up monitoring (default: 120)
 .EXAMPLE
     irm https://raw.githubusercontent.com/0xb0rn3/wingrade/main/wingrade.ps1 | iex
 .EXAMPLE
-    $s = irm https://raw.githubusercontent.com/0xb0rn3/wingrade/main/wingrade.ps1
-    iex "$s -SkipCompatCheck -NoReboot"
+    &([scriptblock]::Create((irm 'https://raw.githubusercontent.com/0xb0rn3/wingrade/main/wingrade.ps1'))) -SkipCompatCheck -NoReboot
 .NOTES
     wingrade by ig:theehiv3 | github: 0xb0rn3
     Requires: PowerShell 4.0+ (native on 8.1), Admin, ~20GB free disk, internet
@@ -76,24 +78,31 @@ $Script:Config = @{
     MountDrive      = $null
     StartTime       = Get-Date
     TranscriptLog   = Join-Path $LogPath 'transcript.log'
-    SuspendedSvcs   = @()   # populated at runtime, used for restore
+    SuspendedSvcs   = @()
     MctUrl          = 'https://go.microsoft.com/fwlink/?LinkId=691209'
 }
 
 # Services safe to STOP (not disable) during the upgrade window.
-# Selection criteria: (a) actively competes for disk I/O / network with
-# setup.exe, (b) safe to restart cleanly post-upgrade, (c) NOT a dependency
-# of setup.exe's own servicing stack (TrustedInstaller, wuauserv itself stays
-# untouched at the STOP level but IS excluded from disable/delayed-start changes).
 $Script:ServiceSuspendList = @(
-    'wuauserv',          # Windows Update Orchestrator — stop fetching, don't disable
-    'UsoSvc',            # Update Orchestrator Service (newer stack component present on some 8.1 KB-updated systems)
-    'BITS',              # Background Intelligent Transfer — competes for bandwidth with our own BITS download
-    'DoSvc',             # Delivery Optimization, if present via update
-    'wscsvc',            # Security Center — noisy during upgrade, non-critical
-    'SysMain',           # Superfetch/Prefetch — actively caching disk I/O we want free
-    'WSearch',           # Windows Search indexer — heavy disk I/O
-    'DiagTrack'          # Connected User Experiences and Telemetry
+    'wuauserv',
+    'UsoSvc',
+    'BITS',
+    'DoSvc',
+    'wscsvc',
+    'SysMain',
+    'WSearch',
+    'DiagTrack'
+)
+
+# Never suspend these regardless of what's in $Script:ServiceSuspendList —
+# stopping any of them during a remote session cuts off your own access.
+$Script:ProtectedServices = @(
+    'TermService',
+    'TeamViewer',
+    'AnyDesk',
+    'vncserver-x64',
+    'RealVNC Server',
+    'Chrome Remote Desktop Service'
 )
 
 # ============================================================
@@ -171,7 +180,6 @@ function Test-Prerequisites {
     }
     Write-Log 'No pending reboot detected' -Level OK
 
-    # BitLocker check — hard stop cause for setup.exe even with compat bypass
     try {
         $bde = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
         if ($bde -and $bde.ProtectionStatus -eq 'On') {
@@ -183,7 +191,6 @@ function Test-Prerequisites {
         Write-Log "BitLocker check skipped (module unavailable or not encrypted): $($_.Exception.Message)" -Level INFO
     }
 
-    # AV presence check — informational, since kernel-driver AV is the #1 silent-fail cause
     try {
         $avProducts = Get-CimInstance -Namespace 'root\SecurityCenter2' -ClassName AntiVirusProduct -ErrorAction SilentlyContinue
         if ($avProducts) {
@@ -192,6 +199,11 @@ function Test-Prerequisites {
             }
         }
     } catch { }
+
+    $remoteTools = Test-RemoteSessionActive
+    if ($remoteTools.Count -gt 0) {
+        Write-Log "Remote session tooling detected: $($remoteTools -join ', ') — excluded from service suspension, you'll get a warning before any reboot" -Level INFO
+    }
 }
 
 function Test-PendingReboot {
@@ -203,6 +215,20 @@ function Test-PendingReboot {
     foreach ($key in $keys) { if (Test-Path $key) { return $true } }
     $pfr = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
     return [bool]$pfr
+}
+
+function Test-RemoteSessionActive {
+    <#
+        Detects common remote-access tooling so reboot warnings are specific
+        instead of generic. Extend this list if you routinely use something
+        other than TeamViewer/RDP.
+    #>
+    $found = @()
+    if (Get-Process -Name 'TeamViewer*' -ErrorAction SilentlyContinue) { $found += 'TeamViewer' }
+    $tvSvc = Get-Service -Name 'TeamViewer' -ErrorAction SilentlyContinue
+    if ($tvSvc -and $tvSvc.Status -eq 'Running') { $found += 'TeamViewer service' }
+    if ($env:SESSIONNAME -like 'RDP-*') { $found += 'RDP' }
+    return ($found | Select-Object -Unique)
 }
 
 # ============================================================
@@ -218,6 +244,11 @@ function Suspend-CompetingServices {
     Write-Log 'NOTE: services are STOPPED, not DISABLED — StartType is untouched, auto-restored on exit' -Level INFO
 
     foreach ($svcName in $Script:ServiceSuspendList) {
+        if ($Script:ProtectedServices -contains $svcName) {
+            Write-Log "Skipping '$svcName' — on protected list, never suspended" -Level INFO
+            continue
+        }
+
         try {
             $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
             if (-not $svc) {
@@ -229,7 +260,6 @@ function Suspend-CompetingServices {
                 continue
             }
 
-            # Record original state before touching it
             $Script:Config.SuspendedSvcs += [PSCustomObject]@{
                 Name          = $svcName
                 OriginalState = $svc.Status
@@ -243,8 +273,6 @@ function Suspend-CompetingServices {
         }
     }
 
-    # Disable non-critical scheduled tasks for the window (Windows Update task
-    # tree specifically — these can silently kick wuauserv back on)
     $tasksToDisable = @(
         '\Microsoft\Windows\WindowsUpdate\Scheduled Start',
         '\Microsoft\Windows\WindowsUpdate\sih',
@@ -310,7 +338,6 @@ function New-PreUpgradeSnapshot {
     Write-Log 'Creating pre-upgrade safety net...'
     New-Item -ItemType Directory -Path $Script:Config.SnapshotDir -Force | Out-Null
 
-    # 1. System Restore point (belt)
     try {
         Enable-ComputerRestore -Drive $env:SystemDrive -ErrorAction SilentlyContinue
         Checkpoint-Computer -Description 'wingrade pre-upgrade snapshot' -RestorePointType 'MODIFY_SETTINGS' -ErrorAction Stop
@@ -319,8 +346,6 @@ function New-PreUpgradeSnapshot {
         Write-Log "System Restore point creation failed (non-fatal): $($_.Exception.Message)" -Level WARN
     }
 
-    # 2. Registry export — HKLM SOFTWARE/SYSTEM hives, small and fast, covers
-    #    driver/service config that setup.exe upgrade sometimes mangles
     try {
         $regBackup = Join-Path $Script:Config.SnapshotDir 'registry'
         New-Item -ItemType Directory -Path $regBackup -Force | Out-Null
@@ -331,8 +356,6 @@ function New-PreUpgradeSnapshot {
         Write-Log "Registry export failed (non-fatal): $($_.Exception.Message)" -Level WARN
     }
 
-    # 3. Driver inventory — captures currently-installed 3rd-party drivers so
-    #    you have a manifest to reinstall against if the upgrade strips any
     try {
         $driverManifest = Join-Path $Script:Config.SnapshotDir 'drivers_pre_upgrade.txt'
         & pnputil.exe /enum-drivers > $driverManifest 2>&1
@@ -341,11 +364,8 @@ function New-PreUpgradeSnapshot {
         Write-Log "Driver manifest capture failed (non-fatal): $($_.Exception.Message)" -Level WARN
     }
 
-    # 4. wbadmin system state backup — the actual heavy insurance, but slow.
-    #    Opt-in via explicit param since it can add 15-30min depending on disk.
-    #    (kept lightweight by default: registry+restore-point+driver list only)
     Write-Log 'Snapshot complete (Restore Point + registry hives + driver manifest)' -Level OK
-    Write-Log "For a full system-state backup, run manually: wbadmin start backup -backupTarget:<drive> -include:C: -allCritical -quiet" -Level INFO
+    Write-Log 'For a full system-state backup, run manually: wbadmin start backup -backupTarget:<drive> -include:C: -allCritical -quiet' -Level INFO
 }
 
 # ============================================================
@@ -368,7 +388,7 @@ function Get-Windows10Iso {
     }
 
     if ($IsoUrl) {
-        Write-Log "Using user-supplied ISO URL, skipping Microsoft download-connector scrape" -Level OK
+        Write-Log 'Using user-supplied ISO URL, skipping Microsoft download-connector scrape' -Level OK
         Invoke-BitsDownload -Url $IsoUrl -Destination $isoPath
         return $isoPath
     }
@@ -380,7 +400,7 @@ function Get-Windows10Iso {
         Write-Log 'Requesting session from Microsoft download servers...'
         $headers = @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 6.3; Win64; x64)' }
 
-        $permalinkUri = "https://www.microsoft.com/en-us/software-download/windows10ISO"
+        $permalinkUri = 'https://www.microsoft.com/en-us/software-download/windows10ISO'
         $null = Invoke-WebRequest -Uri $permalinkUri -Headers $headers -SessionVariable msSession -UseBasicParsing -TimeoutSec 30
 
         $catalogUri = "https://vlscppe.microsoft.com/tags?org_id=y6jn8c31&session_id=$sessionId"
@@ -404,7 +424,7 @@ function Get-Windows10Iso {
         $urlMatch = [regex]::Match($urlResp.Content, "href=`"([^`"]+)`"[^>]*>[^<]*$archPattern")
         if (-not $urlMatch.Success) { throw "Could not extract $archPattern URL" }
 
-        $downloadUrl = [System.Web.HttpUtility]::HtmlDecode($urlMatch.Groups[1].Value)
+        $downloadUrl = [System.Net.WebUtility]::HtmlDecode($urlMatch.Groups[1].Value)
         Write-Log 'Resolved direct ISO URL (expires ~24h)' -Level OK
 
     } catch {
@@ -422,7 +442,7 @@ function Get-Windows10IsoViaMCT {
     Invoke-BitsDownload -Url $Script:Config.MctUrl -Destination $mctPath
     Write-Log 'Launching Media Creation Tool interactively (no documented silent ISO-only switch exists)...' -Level WARN
     Start-Process -FilePath $mctPath -Wait
-    Exit-Fatal 'MCT requires manual completion. Re-run with -IsoUrl pointing at the resulting ISO, or place it at the iso directory and re-run.'
+    Exit-Fatal 'MCT requires manual completion. Re-run with -IsoUrl pointing at the resulting ISO, or place it in the iso directory and re-run.'
 }
 
 function Invoke-BitsDownload {
@@ -493,7 +513,7 @@ function Mount-InstallIso {
         Write-Log "Mounted at $($Script:Config.MountDrive)" -Level OK
 
         $setupExe = Join-Path $Script:Config.MountDrive 'setup.exe'
-        if (-not (Test-Path $setupExe)) { throw "setup.exe not found — ISO structure unexpected" }
+        if (-not (Test-Path $setupExe)) { throw 'setup.exe not found — ISO structure unexpected' }
         return $setupExe
     } catch {
         Exit-Fatal "Failed to mount ISO: $($_.Exception.Message)"
@@ -501,12 +521,6 @@ function Mount-InstallIso {
 }
 
 function New-UnattendFile {
-    <#
-        Only invoked if -UnattendPath is supplied. Copies user's unattend.xml
-        into the location setup.exe auto-discovers it from (root of a drive
-        it scans, or explicitly via /unattend: switch — we use the switch,
-        more reliable than relying on autodiscovery).
-    #>
     if (-not $UnattendPath) { return $null }
     if (-not (Test-Path $UnattendPath)) {
         Write-Log "Specified UnattendPath '$UnattendPath' not found — proceeding WITHOUT unattend injection" -Level WARN
@@ -573,7 +587,7 @@ function Invoke-Win10Setup {
         3010        { Write-Log 'Success, reboot required' -Level OK; return $true }
         -1047526904 { Exit-Fatal 'Compat check blocked upgrade (0xC1900208). Re-run with -SkipCompatCheck.' }
         -1047526912 { Exit-Fatal 'Insufficient disk space for upgrade staging (0xC1900200).' }
-        default     { Write-Log "Unrecognized exit code — check $($Script:Config.LogDir) and `$env:SystemDrive\`$WINDOWS.~BT\Sources\Panther\" -Level ERROR; return $false }
+        default     { Write-Log "Unrecognized exit code $exitCode — check $($Script:Config.LogDir) and %SystemDrive%\`$WINDOWS.~BT\Sources\Panther\" -Level ERROR; return $false }
     }
 }
 
@@ -614,11 +628,18 @@ function Main {
                 $elapsed = (Get-Date) - $Script:Config.StartTime
                 Write-Log "Staging complete in $([math]::Round($elapsed.TotalMinutes, 1)) minutes" -Level OK
 
+                $remoteTools = Test-RemoteSessionActive
+                if ($remoteTools.Count -gt 0) {
+                    Write-Log "Remote session detected via: $($remoteTools -join ', ')" -Level WARN
+                    Write-Log 'This connection WILL drop on reboot. Confirm unattended access + "control at Windows login screen" is enabled before proceeding, or you lose access until someone relaunches TeamViewer locally.' -Level WARN
+                }
+
                 if ($NoReboot) {
                     Write-Log 'NoReboot set — run "shutdown /r /t 0" manually to complete' -Level WARN
                 } else {
-                    Write-Log 'Rebooting in 30s to complete upgrade... (Ctrl+C to cancel)' -Level WARN
-                    Start-Sleep -Seconds 30
+                    $delay = if ($remoteTools.Count -gt 0) { 60 } else { 30 }
+                    Write-Log "Rebooting in ${delay}s to complete upgrade... (Ctrl+C to cancel)" -Level WARN
+                    Start-Sleep -Seconds $delay
                     Restart-Computer -Force
                 }
             } else {
@@ -628,10 +649,6 @@ function Main {
             Dismount-InstallIso -IsoPath $isoPath
         }
     } finally {
-        # Runs even on success — if we DIDN'T reboot (NoReboot flag), services
-        # get restored immediately. If we DID reboot, this line never
-        # executes (process is gone), which is fine: the fresh Win10 boot
-        # will bring its own service defaults up cleanly on its own.
         Restore-SuspendedServices
     }
 }
